@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Комплектующие ПК</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div class="container">
+        <h1>Популярные комплектующие ПК</h1>
+
+        <!-- Комплектующее 1: Процессор -->
+        <div class="component-card">
+            <div class="component-header">
+                <h2>Процессор</h2>
+                <button class="show-btn" onclick="toggleDescription('cpu')">Показать описание</button>
+            </div>
+            <div id="cpu" class="description">
+                <div class="component-info">
+                    <p><strong>Тип:</strong> Центральный процессор (CPU)</p>
+                    <p><strong>Производитель:</strong> Intel, AMD</p>
+                    <p><strong>Частота:</strong> 3.0–5.5 ГГц</p>
+                    <p><strong>Ядра / Потоки:</strong> 4–16 / 8–32</p>
+                </div>
+                <div class="component-plot">
+                    <p><strong>Описание:</strong> Центральный процессор – "мозг" компьютера, отвечающий за выполнение всех вычислений. Влияет на быстродействие системы и работу приложений.</p>
+                </div>
+            </div>
+        </div>
+
+        <!-- Комплектующее 2: Видеокарта -->
+        <div class="component-card">
+            <div class="component-header">
+                <h2>Видеокарта</h2>
+                <button class="show-btn" onclick="toggleDescription('gpu')">Показать описание</button>
+            </div>
+            <div id="gpu" class="description">
+                <div class="component-info">
+                    <p><strong>Тип:</strong> Графический процессор (GPU)</p>
+                    <p><strong>Производитель:</strong> NVIDIA, AMD</p>
+                    <p><strong>Видеопамять:</strong> 4–24 ГБ GDDR6/GDDR6X</p>
+                    <p><strong>Назначение:</strong> Игры, 3D-моделирование, AI</p>
+                </div>
+                <div class="component-plot">
+                    <p><strong>Описание:</strong> Видеокарта отвечает за обработку графики. Чем мощнее GPU, тем выше качество графики и FPS в играх и профессиональных приложениях.</p>
+                </div>
+            </div>
+        </div>
+
+        <!-- Комплектующее 3: Оперативная память -->
+        <div class="component-card">
+            <div class="component-header">
+                <h2>Оперативная память</h2>
+                <button class="show-btn" onclick="toggleDescription('ram')">Показать описание</button>
+            </div>
+            <div id="ram" class="description">
+                <div class="component-info">
+                    <p><strong>Тип:</strong> DDR4 / DDR5</p>
+                    <p><strong>Объем:</strong> 8–64 ГБ</p>
+                    <p><strong>Частота:</strong> 3200–6000 МГц</p>
+                    <p><strong>Производитель:</strong> Corsair, Kingston, G.Skill</p>
+                </div>
+                <div class="component-plot">
+                    <p><strong>Описание:</strong> Оперативная память хранит временные данные для быстрого доступа процессора. Влияет на скорость работы системы и многозадачность.</p>
+                </div>
+            </div>
+        </div>
+
+    </div>
+
+    <script src="app.js"></script>
+</body>
+</html>
