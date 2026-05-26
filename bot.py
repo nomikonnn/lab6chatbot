@@ -18,7 +18,7 @@ logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s
 logger = logging.getLogger(__name__)
 
 # ─── States ───
-MENU, ADD_WORD, QUIZ_ANSWER = range(3)
+MENU, ADD_WORD, QUIZ_ANSWER, DELETE_WORD = range(4)
 
 # ─── Database ───
 DB_PATH = os.getenv("DB_PATH", "vocab.db")
@@ -52,6 +52,15 @@ def db_get_words(user_id: int) -> list[tuple[str, str]]:
     return rows
 
 
+def db_word_exists(user_id: int, word: str) -> bool:
+    conn = get_db()
+    row = conn.execute(
+        "SELECT 1 FROM words WHERE user_id = ? AND LOWER(word) = LOWER(?)", (user_id, word)
+    ).fetchone()
+    conn.close()
+    return row is not None
+
+
 def db_delete_word(user_id: int, word: str) -> bool:
     conn = get_db()
     cur = conn.execute("DELETE FROM words WHERE user_id = ? AND LOWER(word) = LOWER(?)", (user_id, word))
@@ -61,10 +70,30 @@ def db_delete_word(user_id: int, word: str) -> bool:
     return deleted
 
 
+def db_delete_by_id(word_id: int, user_id: int) -> tuple[bool, str]:
+    """Удаляет слово по id, возвращает (успех, слово)."""
+    conn = get_db()
+    row = conn.execute("SELECT word FROM words WHERE id = ? AND user_id = ?", (word_id, user_id)).fetchone()
+    if not row:
+        conn.close()
+        return False, ""
+    conn.execute("DELETE FROM words WHERE id = ? AND user_id = ?", (word_id, user_id))
+    conn.commit()
+    conn.close()
+    return True, row[0]
+
+
+def db_get_words_with_ids(user_id: int) -> list[tuple[int, str, str]]:
+    conn = get_db()
+    rows = conn.execute("SELECT id, word, translation FROM words WHERE user_id = ?", (user_id,)).fetchall()
+    conn.close()
+    return rows
+
+
 # ─── Keyboards ───
 def main_menu_kb():
     return ReplyKeyboardMarkup(
-        [["📝 Добавить слово", "🧠 Тест"], ["📋 Мои слова"]],
+        [["📝 Добавить слово", "🧠 Тест"], ["📋 Мои слова", "🗑 Удалить слово"]],
         resize_keyboard=True,
     )
 
@@ -76,8 +105,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         "Привет! 👋 Я помогу тебе учить английские слова.\n\n"
         "📝 *Добавить слово* — сохранить новое слово с переводом\n"
         "🧠 *Тест* — проверить себя\n"
-        "📋 *Мои слова* — посмотреть весь словарь\n\n"
-        "Также: /delete слово — удалить слово из словаря",
+        "📋 *Мои слова* — посмотреть весь словарь\n"
+        "🗑 *Удалить слово* — убрать слово из словаря",
         parse_mode="Markdown",
         reply_markup=main_menu_kb(),
     )
@@ -104,6 +133,9 @@ async def menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
     if text == "📋 Мои слова":
         return await show_words(update, context)
 
+    if text == "🗑 Удалить слово":
+        return await delete_word_start(update, context)
+
     await update.message.reply_text("Выбери действие из меню 👇", reply_markup=main_menu_kb())
     return MENU
 
@@ -125,6 +157,13 @@ async def add_word(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
     if not word or not translation:
         await update.message.reply_text("❌ Слово и перевод не могут быть пустыми.")
+        return ADD_WORD
+
+    if db_word_exists(update.effective_user.id, word):
+        await update.message.reply_text(
+            f"⚠️ Слово *{word}* уже есть в твоём словаре. Введи другое слово.",
+            parse_mode="Markdown",
+        )
         return ADD_WORD
 
     db_add_word(update.effective_user.id, word, translation)
@@ -187,8 +226,78 @@ async def show_words(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     return MENU
 
 
-# ── Delete word ──
-async def delete_word(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+# ── Delete word (interactive) ──
+async def delete_word_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    words = db_get_words_with_ids(update.effective_user.id)
+
+    if not words:
+        await update.message.reply_text("📭 Словарь пуст — нечего удалять.", reply_markup=main_menu_kb())
+        return MENU
+
+    # Показываем слова инлайн-кнопками (по 2 в ряд)
+    buttons = []
+    row = []
+    for wid, word, translation in words:
+        row.append(InlineKeyboardButton(f"❌ {word}", callback_data=f"del_{wid}"))
+        if len(row) == 2:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
+
+    buttons.append([InlineKeyboardButton("🏠 В меню", callback_data="del_cancel")])
+
+    await update.message.reply_text(
+        "🗑 *Нажми на слово, чтобы удалить его:*",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
+    return DELETE_WORD
+
+
+async def delete_word_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+
+    if query.data == "del_cancel":
+        await query.message.reply_text("🏠 Главное меню", reply_markup=main_menu_kb())
+        return MENU
+
+    word_id = int(query.data.replace("del_", ""))
+    deleted, word = db_delete_by_id(word_id, update.effective_user.id)
+
+    if deleted:
+        await query.message.reply_text(f"🗑 Слово *{word}* удалено.", parse_mode="Markdown")
+    else:
+        await query.message.reply_text("❌ Слово уже удалено.")
+
+    # Показываем обновлённый список или возвращаемся в меню
+    remaining = db_get_words_with_ids(update.effective_user.id)
+    if not remaining:
+        await query.message.reply_text("📭 Словарь пуст.", reply_markup=main_menu_kb())
+        return MENU
+
+    buttons = []
+    row = []
+    for wid, w, t in remaining:
+        row.append(InlineKeyboardButton(f"❌ {w}", callback_data=f"del_{wid}"))
+        if len(row) == 2:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
+    buttons.append([InlineKeyboardButton("🏠 В меню", callback_data="del_cancel")])
+
+    await query.message.reply_text(
+        "🗑 *Удалить ещё?*",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
+    return DELETE_WORD
+
+
+# ── Delete by command (fallback) ──
+async def delete_word_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     parts = update.message.text.split(maxsplit=1)
     if len(parts) < 2:
         await update.message.reply_text("Укажи слово: /delete apple")
@@ -360,8 +469,8 @@ def main():
         entry_points=[CommandHandler("start", start)],
         states={
             MENU: [
-                MessageHandler(filters.Regex("^(📝 Добавить слово|🧠 Тест|📋 Мои слова)$"), menu_router),
-                CommandHandler("delete", delete_word),
+                MessageHandler(filters.Regex("^(📝 Добавить слово|🧠 Тест|📋 Мои слова|🗑 Удалить слово)$"), menu_router),
+                CommandHandler("delete", delete_word_cmd),
             ],
             ADD_WORD: [
                 MessageHandler(filters.Regex("^(📝 Добавить ещё|🏠 В меню)$"), add_word_menu),
@@ -371,11 +480,14 @@ def main():
                 CallbackQueryHandler(quiz_callback, pattern="^quiz_"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, quiz_answer),
             ],
+            DELETE_WORD: [
+                CallbackQueryHandler(delete_word_callback, pattern="^del_"),
+            ],
         },
         fallbacks=[
             CommandHandler("cancel", cancel),
             CommandHandler("start", start),
-            CommandHandler("delete", delete_word),
+            CommandHandler("delete", delete_word_cmd),
         ],
     )
 
