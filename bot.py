@@ -316,69 +316,92 @@ async def delete_word_start(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         await update.message.reply_text("📭 Словарь пуст — нечего удалять.", reply_markup=main_menu_kb())
         return MENU
 
-    # Показываем слова инлайн-кнопками (по 2 в ряд)
-    buttons = []
-    row = []
-    for wid, word, translation, ctx in words:
-        label = f"❌ {word}" if not ctx else f"❌ {word} ({ctx})"
-        # callback_data max 64 bytes — обрезаем если надо
-        row.append(InlineKeyboardButton(label[:60], callback_data=f"del_{wid}"))
-        if len(row) == 2:
-            buttons.append(row)
-            row = []
-    if row:
-        buttons.append(row)
+    # Сохраняем список для поиска по номеру
+    context.user_data["delete_words"] = words
 
-    buttons.append([InlineKeyboardButton("🏠 В меню", callback_data="del_cancel")])
+    return await _show_delete_list(update.message, words)
 
-    await update.message.reply_text(
-        "🗑 *Нажми на слово, чтобы удалить его:*",
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup(buttons),
-    )
+
+async def _show_delete_list(msg, words: list) -> int:
+    """Показывает нумерованный список слов для удаления."""
+    lines = []
+    for i, (wid, w, t, c) in enumerate(words, 1):
+        line = f"{i}. *{w}* → {t}"
+        if c:
+            line += f"  _({c})_"
+        lines.append(line)
+
+    kb = ReplyKeyboardMarkup([["🏠 В меню"]], resize_keyboard=True)
+
+    # Разбиваем на чанки если список большой
+    chunk = []
+    length = 0
+    for line in lines:
+        if length + len(line) > 3500:
+            await msg.reply_text("\n".join(chunk), parse_mode="Markdown")
+            chunk = []
+            length = 0
+        chunk.append(line)
+        length += len(line)
+
+    header = f"🗑 *Удаление слов* ({len(words)} шт.)\n\nВведи *номер* или *слово* для удаления:\n\n"
+    if chunk:
+        await msg.reply_text(
+            header + "\n".join(chunk),
+            parse_mode="Markdown",
+            reply_markup=kb,
+        )
+
     return DELETE_WORD
 
 
-async def delete_word_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    query = update.callback_query
-    await query.answer()
+async def delete_word_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    text = update.message.text.strip()
 
-    if query.data == "del_cancel":
-        await query.message.reply_text("🏠 Главное меню", reply_markup=main_menu_kb())
+    if text == "🏠 В меню":
+        context.user_data.pop("delete_words", None)
+        await update.message.reply_text("🏠 Главное меню", reply_markup=main_menu_kb())
         return MENU
 
-    word_id = int(query.data.replace("del_", ""))
-    deleted, word = db_delete_by_id(word_id, update.effective_user.id)
+    words = context.user_data.get("delete_words", [])
+    if not words:
+        await update.message.reply_text("Список устарел. Попробуй снова.", reply_markup=main_menu_kb())
+        return MENU
+
+    user_id = update.effective_user.id
+    deleted = False
+    deleted_word = ""
+
+    # Попытка удалить по номеру
+    if text.isdigit():
+        idx = int(text) - 1
+        if 0 <= idx < len(words):
+            wid = words[idx][0]
+            deleted, deleted_word = db_delete_by_id(wid, user_id)
+        else:
+            await update.message.reply_text(f"❌ Нет слова с номером *{text}*. Введи от 1 до {len(words)}.", parse_mode="Markdown")
+            return DELETE_WORD
+    else:
+        # Попытка удалить по слову
+        deleted = db_delete_word(user_id, text)
+        deleted_word = text
 
     if deleted:
-        await query.message.reply_text(f"🗑 Слово *{word}* удалено.", parse_mode="Markdown")
+        await update.message.reply_text(f"🗑 *{deleted_word}* — удалено.", parse_mode="Markdown")
+
+        # Обновляем список
+        remaining = db_get_words_with_ids(user_id)
+        context.user_data["delete_words"] = remaining
+
+        if not remaining:
+            context.user_data.pop("delete_words", None)
+            await update.message.reply_text("📭 Словарь пуст.", reply_markup=main_menu_kb())
+            return MENU
+
+        return await _show_delete_list(update.message, remaining)
     else:
-        await query.message.reply_text("❌ Слово уже удалено.")
-
-    # Показываем обновлённый список или возвращаемся в меню
-    remaining = db_get_words_with_ids(update.effective_user.id)
-    if not remaining:
-        await query.message.reply_text("📭 Словарь пуст.", reply_markup=main_menu_kb())
-        return MENU
-
-    buttons = []
-    row = []
-    for wid, w, t, c in remaining:
-        label = f"❌ {w}" if not c else f"❌ {w} ({c})"
-        row.append(InlineKeyboardButton(label[:60], callback_data=f"del_{wid}"))
-        if len(row) == 2:
-            buttons.append(row)
-            row = []
-    if row:
-        buttons.append(row)
-    buttons.append([InlineKeyboardButton("🏠 В меню", callback_data="del_cancel")])
-
-    await query.message.reply_text(
-        "🗑 *Удалить ещё?*",
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup(buttons),
-    )
-    return DELETE_WORD
+        await update.message.reply_text(f"❌ Слово *{deleted_word}* не найдено.", parse_mode="Markdown")
+        return DELETE_WORD
 
 
 # ── Delete by command (fallback) ──
@@ -598,8 +621,7 @@ async def _process_import(update: Update, context: ContextTypes.DEFAULT_TYPE, li
     return MENU
 
 
-# ── Cancel ──
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+# ── Cancel ──async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data.clear()
     await update.message.reply_text("🏠 Главное меню", reply_markup=main_menu_kb())
     return MENU
@@ -629,7 +651,7 @@ def main():
                 MessageHandler(filters.TEXT & ~filters.COMMAND, quiz_answer),
             ],
             DELETE_WORD: [
-                CallbackQueryHandler(delete_word_callback, pattern="^del_"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, delete_word_input),
             ],
             IMPORT: [
                 MessageHandler(filters.Document.ALL, import_file),
