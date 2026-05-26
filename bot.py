@@ -18,7 +18,7 @@ logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s
 logger = logging.getLogger(__name__)
 
 # ─── States ───
-MENU, ADD_WORD, QUIZ_ANSWER, DELETE_WORD = range(4)
+MENU, ADD_WORD, QUIZ_ANSWER, DELETE_WORD, IMPORT = range(5)
 
 # ─── Database ───
 DB_PATH = os.getenv("DB_PATH", "vocab.db")
@@ -52,6 +52,46 @@ def db_add_word(user_id: int, word: str, translation: str, context: str = ""):
     )
     conn.commit()
     conn.close()
+
+
+def db_add_words_bulk(user_id: int, words_list: list[tuple[str, str, str]]) -> tuple[int, int, list[str]]:
+    """Массовое добавление. Возвращает (добавлено, пропущено_дубликатов, список_ошибок)."""
+    conn = get_db()
+    added = 0
+    skipped = 0
+    errors = []
+
+    for word, translation, ctx in words_list:
+        exists = conn.execute(
+            "SELECT 1 FROM words WHERE user_id = ? AND LOWER(word) = LOWER(?) AND LOWER(COALESCE(context, '')) = LOWER(?)",
+            (user_id, word, ctx),
+        ).fetchone()
+        if exists:
+            skipped += 1
+            continue
+        conn.execute(
+            "INSERT INTO words (user_id, word, translation, context) VALUES (?, ?, ?, ?)",
+            (user_id, word, translation, ctx),
+        )
+        added += 1
+
+    conn.commit()
+    conn.close()
+    return added, skipped, errors
+
+
+def parse_word_line(line: str) -> tuple[str, str, str] | None:
+    """Парсит строку формата 'word - translation - context'. Возвращает None при ошибке."""
+    line = line.strip()
+    if not line or " - " not in line:
+        return None
+    parts = [p.strip() for p in line.split(" - ")]
+    word = parts[0]
+    translation = parts[1] if len(parts) >= 2 else ""
+    ctx = parts[2] if len(parts) >= 3 else ""
+    if not word or not translation:
+        return None
+    return word, translation, ctx
 
 
 def db_get_words(user_id: int) -> list[tuple[str, str, str]]:
@@ -108,7 +148,7 @@ def db_get_words_with_ids(user_id: int) -> list[tuple[int, str, str, str]]:
 # ─── Keyboards ───
 def main_menu_kb():
     return ReplyKeyboardMarkup(
-        [["📝 Добавить слово", "🧠 Тест"], ["📋 Мои слова", "🗑 Удалить слово"]],
+        [["📝 Добавить слово", "🧠 Тест"], ["📋 Мои слова", "🗑 Удалить слово"], ["📥 Импорт"]],
         resize_keyboard=True,
     )
 
@@ -119,6 +159,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     await update.message.reply_text(
         "Привет! 👋 Я помогу тебе учить английские слова.\n\n"
         "📝 *Добавить слово* — сохранить новое слово с переводом\n"
+        "📥 *Импорт* — загрузить список слов разом\n"
         "🧠 *Тест* — проверить себя\n"
         "📋 *Мои слова* — посмотреть весь словарь\n"
         "🗑 *Удалить слово* — убрать слово из словаря",
@@ -153,6 +194,20 @@ async def menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
 
     if text == "🗑 Удалить слово":
         return await delete_word_start(update, context)
+
+    if text == "📥 Импорт":
+        await update.message.reply_text(
+            "📥 *Массовый импорт*\n\n"
+            "Отправь список слов — каждое с новой строки:\n\n"
+            "`apple - яблоко`\n"
+            "`run - бежать - he runs fast`\n"
+            "`spot - место - save me a spot`\n\n"
+            "Или отправь *.txt файл* с таким списком.\n\n"
+            "/cancel — вернуться в меню",
+            parse_mode="Markdown",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        return IMPORT
 
     await update.message.reply_text("Выбери действие из меню 👇", reply_markup=main_menu_kb())
     return MENU
@@ -480,6 +535,69 @@ async def finish_quiz(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
     return MENU
 
 
+# ── Import (bulk) ──
+async def import_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Обработка многострочного текстового сообщения с импортом."""
+    text = update.message.text.strip()
+    lines = text.splitlines()
+    return await _process_import(update, context, lines)
+
+
+async def import_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Обработка .txt файла с импортом."""
+    doc = update.message.document
+
+    if not doc.file_name.endswith(".txt"):
+        await update.message.reply_text("❌ Поддерживаются только *.txt* файлы.", parse_mode="Markdown")
+        return IMPORT
+
+    file = await doc.get_file()
+    content = (await file.download_as_bytearray()).decode("utf-8", errors="ignore")
+    lines = content.strip().splitlines()
+    return await _process_import(update, context, lines)
+
+
+async def _process_import(update: Update, context: ContextTypes.DEFAULT_TYPE, lines: list[str]) -> int:
+    """Общая логика импорта для текста и файлов."""
+    parsed = []
+    bad_lines = []
+
+    for i, line in enumerate(lines, 1):
+        line = line.strip()
+        if not line:
+            continue
+        result = parse_word_line(line)
+        if result:
+            parsed.append(result)
+        else:
+            bad_lines.append(f"строка {i}: `{line[:50]}`")
+
+    if not parsed:
+        await update.message.reply_text(
+            "❌ Не удалось распознать ни одного слова.\n\n"
+            "Формат: `слово - перевод - контекст`\n"
+            "Каждое слово с новой строки.",
+            parse_mode="Markdown",
+        )
+        return IMPORT
+
+    added, skipped, _ = db_add_words_bulk(update.effective_user.id, parsed)
+
+    # Формируем отчёт
+    report = f"📥 *Импорт завершён!*\n\n✅ Добавлено: *{added}*"
+    if skipped:
+        report += f"\n⏭ Дубликатов пропущено: *{skipped}*"
+    if bad_lines:
+        preview = bad_lines[:5]
+        report += f"\n❌ Ошибок формата: *{len(bad_lines)}*"
+        report += "\n" + "\n".join(preview)
+        if len(bad_lines) > 5:
+            report += f"\n...и ещё {len(bad_lines) - 5}"
+
+    await update.message.reply_text(report, parse_mode="Markdown", reply_markup=main_menu_kb())
+    return MENU
+
+
 # ── Cancel ──
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data.clear()
@@ -499,7 +617,7 @@ def main():
         entry_points=[CommandHandler("start", start)],
         states={
             MENU: [
-                MessageHandler(filters.Regex("^(📝 Добавить слово|🧠 Тест|📋 Мои слова|🗑 Удалить слово)$"), menu_router),
+                MessageHandler(filters.Regex("^(📝 Добавить слово|🧠 Тест|📋 Мои слова|🗑 Удалить слово|📥 Импорт)$"), menu_router),
                 CommandHandler("delete", delete_word_cmd),
             ],
             ADD_WORD: [
@@ -512,6 +630,10 @@ def main():
             ],
             DELETE_WORD: [
                 CallbackQueryHandler(delete_word_callback, pattern="^del_"),
+            ],
+            IMPORT: [
+                MessageHandler(filters.Document.ALL, import_file),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, import_text),
             ],
         },
         fallbacks=[
