@@ -621,7 +621,8 @@ async def _process_import(update: Update, context: ContextTypes.DEFAULT_TYPE, li
     return MENU
 
 
-# ── Cancel ──async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+# ── Cancel ──
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data.clear()
     await update.message.reply_text("🏠 Главное меню", reply_markup=main_menu_kb())
     return MENU
