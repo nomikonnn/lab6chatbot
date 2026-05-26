@@ -31,31 +31,44 @@ def get_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER NOT NULL,
             word TEXT NOT NULL,
-            translation TEXT NOT NULL
+            translation TEXT NOT NULL,
+            context TEXT DEFAULT ''
         )"""
     )
+    # Миграция: добавляем столбец context, если его нет
+    try:
+        conn.execute("ALTER TABLE words ADD COLUMN context TEXT DEFAULT ''")
+    except sqlite3.OperationalError:
+        pass  # столбец уже существует
     conn.commit()
     return conn
 
 
-def db_add_word(user_id: int, word: str, translation: str):
+def db_add_word(user_id: int, word: str, translation: str, context: str = ""):
     conn = get_db()
-    conn.execute("INSERT INTO words (user_id, word, translation) VALUES (?, ?, ?)", (user_id, word, translation))
+    conn.execute(
+        "INSERT INTO words (user_id, word, translation, context) VALUES (?, ?, ?, ?)",
+        (user_id, word, translation, context),
+    )
     conn.commit()
     conn.close()
 
 
-def db_get_words(user_id: int) -> list[tuple[str, str]]:
+def db_get_words(user_id: int) -> list[tuple[str, str, str]]:
     conn = get_db()
-    rows = conn.execute("SELECT word, translation FROM words WHERE user_id = ?", (user_id,)).fetchall()
+    rows = conn.execute(
+        "SELECT word, translation, COALESCE(context, '') FROM words WHERE user_id = ?", (user_id,)
+    ).fetchall()
     conn.close()
     return rows
 
 
-def db_word_exists(user_id: int, word: str) -> bool:
+def db_word_exists(user_id: int, word: str, context: str = "") -> bool:
+    """Проверяет дубликат по слову + контексту. Одно слово с разным контекстом — ок."""
     conn = get_db()
     row = conn.execute(
-        "SELECT 1 FROM words WHERE user_id = ? AND LOWER(word) = LOWER(?)", (user_id, word)
+        "SELECT 1 FROM words WHERE user_id = ? AND LOWER(word) = LOWER(?) AND LOWER(COALESCE(context, '')) = LOWER(?)",
+        (user_id, word, context),
     ).fetchone()
     conn.close()
     return row is not None
@@ -83,9 +96,11 @@ def db_delete_by_id(word_id: int, user_id: int) -> tuple[bool, str]:
     return True, row[0]
 
 
-def db_get_words_with_ids(user_id: int) -> list[tuple[int, str, str]]:
+def db_get_words_with_ids(user_id: int) -> list[tuple[int, str, str, str]]:
     conn = get_db()
-    rows = conn.execute("SELECT id, word, translation FROM words WHERE user_id = ?", (user_id,)).fetchall()
+    rows = conn.execute(
+        "SELECT id, word, translation, COALESCE(context, '') FROM words WHERE user_id = ?", (user_id,)
+    ).fetchall()
     conn.close()
     return rows
 
@@ -120,8 +135,11 @@ async def menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
     if text == "📝 Добавить слово":
         await update.message.reply_text(
             "Введи слово и перевод через дефис:\n\n"
-            "Например: *apple - яблоко*\n\n"
-            "Или отправь /cancel чтобы вернуться.",
+            "• *apple - яблоко*\n"
+            "• *run - бежать - he runs fast* (с контекстом)\n\n"
+            "Контекст необязателен, но помогает запомнить\n"
+            "разные значения одного слова.\n\n"
+            "/cancel — вернуться в меню",
             parse_mode="Markdown",
             reply_markup=ReplyKeyboardRemove(),
         )
@@ -146,34 +164,38 @@ async def add_word(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
     if " - " not in text:
         await update.message.reply_text(
-            "❌ Неверный формат. Используй дефис:\n*apple - яблоко*",
+            "❌ Неверный формат. Используй дефис:\n"
+            "*apple - яблоко*\n"
+            "*run - бежать - he runs fast*",
             parse_mode="Markdown",
         )
         return ADD_WORD
 
-    parts = text.split(" - ", 1)
-    word = parts[0].strip()
-    translation = parts[1].strip()
+    parts = [p.strip() for p in text.split(" - ")]
+    word = parts[0]
+    translation = parts[1] if len(parts) >= 2 else ""
+    word_context = parts[2] if len(parts) >= 3 else ""
 
     if not word or not translation:
         await update.message.reply_text("❌ Слово и перевод не могут быть пустыми.")
         return ADD_WORD
 
-    if db_word_exists(update.effective_user.id, word):
+    if db_word_exists(update.effective_user.id, word, word_context):
+        label = f"*{word}*" if not word_context else f"*{word}* ({word_context})"
         await update.message.reply_text(
-            f"⚠️ Слово *{word}* уже есть в твоём словаре. Введи другое слово.",
+            f"⚠️ {label} уже есть в словаре. Введи другое.",
             parse_mode="Markdown",
         )
         return ADD_WORD
 
-    db_add_word(update.effective_user.id, word, translation)
+    db_add_word(update.effective_user.id, word, translation, word_context)
+
+    saved_text = f"✅ *{word}* → *{translation}*"
+    if word_context:
+        saved_text += f"\n💬 _{word_context}_"
 
     kb = ReplyKeyboardMarkup([["📝 Добавить ещё", "🏠 В меню"]], resize_keyboard=True)
-    await update.message.reply_text(
-        f"✅ Сохранено: *{word}* → *{translation}*",
-        parse_mode="Markdown",
-        reply_markup=kb,
-    )
+    await update.message.reply_text(saved_text, parse_mode="Markdown", reply_markup=kb)
     return ADD_WORD
 
 
@@ -203,7 +225,12 @@ async def show_words(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         await update.message.reply_text("📭 Словарь пуст. Добавь первое слово!", reply_markup=main_menu_kb())
         return MENU
 
-    lines = [f"{i}. *{w}* → {t}" for i, (w, t) in enumerate(words, 1)]
+    lines = []
+    for i, (w, t, c) in enumerate(words, 1):
+        line = f"{i}. *{w}* → {t}"
+        if c:
+            line += f"  _({c})_"
+        lines.append(line)
 
     # Телеграм ограничивает длину сообщения
     chunk = []
@@ -237,8 +264,10 @@ async def delete_word_start(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     # Показываем слова инлайн-кнопками (по 2 в ряд)
     buttons = []
     row = []
-    for wid, word, translation in words:
-        row.append(InlineKeyboardButton(f"❌ {word}", callback_data=f"del_{wid}"))
+    for wid, word, translation, ctx in words:
+        label = f"❌ {word}" if not ctx else f"❌ {word} ({ctx})"
+        # callback_data max 64 bytes — обрезаем если надо
+        row.append(InlineKeyboardButton(label[:60], callback_data=f"del_{wid}"))
         if len(row) == 2:
             buttons.append(row)
             row = []
@@ -279,8 +308,9 @@ async def delete_word_callback(update: Update, context: ContextTypes.DEFAULT_TYP
 
     buttons = []
     row = []
-    for wid, w, t in remaining:
-        row.append(InlineKeyboardButton(f"❌ {w}", callback_data=f"del_{wid}"))
+    for wid, w, t, c in remaining:
+        label = f"❌ {w}" if not c else f"❌ {w} ({c})"
+        row.append(InlineKeyboardButton(label[:60], callback_data=f"del_{wid}"))
         if len(row) == 2:
             buttons.append(row)
             row = []
@@ -348,7 +378,7 @@ async def send_quiz_question(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if idx >= len(words):
         return await finish_quiz(update, context)
 
-    word, _ = words[idx]
+    word, _, ctx = words[idx]
     num = idx + 1
     total = context.user_data["quiz_total"]
 
@@ -357,19 +387,19 @@ async def send_quiz_question(update: Update, context: ContextTypes.DEFAULT_TYPE)
         [InlineKeyboardButton("❌ Закончить тест", callback_data="quiz_stop")],
     ])
 
+    question = f"*[{num}/{total}]* Переведи: *{word}*"
+    if ctx:
+        question += f"\n💬 _{ctx}_"
+
     msg = update.message or update.callback_query.message
-    await msg.reply_text(
-        f"*[{num}/{total}]* Переведи: *{word}*",
-        parse_mode="Markdown",
-        reply_markup=kb,
-    )
+    await msg.reply_text(question, parse_mode="Markdown", reply_markup=kb)
     return QUIZ_ANSWER
 
 
 async def quiz_answer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     idx = context.user_data["quiz_index"]
     words = context.user_data["quiz_words"]
-    _, correct_translation = words[idx]
+    _, correct_translation, _ = words[idx]
 
     user_answer = update.message.text.strip().lower()
     correct = correct_translation.strip().lower()
@@ -395,7 +425,7 @@ async def quiz_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     if query.data == "quiz_skip":
         idx = context.user_data["quiz_index"]
         words = context.user_data["quiz_words"]
-        _, correct_translation = words[idx]
+        _, correct_translation, _ = words[idx]
 
         context.user_data["quiz_skipped"] += 1
         context.user_data["quiz_index"] += 1
